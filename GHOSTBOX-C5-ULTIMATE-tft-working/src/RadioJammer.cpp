@@ -1,0 +1,255 @@
+#include "jammer.h"
+
+#include <RF24.h>
+#include <SPI.h>
+
+#include "DisplayTFT.h"
+#include "Input.h"
+#include "PepeDraw.h"
+#include "Pins.h"
+#include "SharedSpi.h"
+
+extern DisplayTFT tft;
+
+#ifndef RADIO_JAMMER_SPI_SPEED
+#define RADIO_JAMMER_SPI_SPEED 8000000
+#endif
+
+static RF24 jam1(NRF1_CE_PIN, NRF1_CSN_PIN, RADIO_JAMMER_SPI_SPEED);
+static RF24 jam2(NRF2_CE_PIN, NRF2_CSN_PIN, RADIO_JAMMER_SPI_SPEED);
+static bool jam1Ok = false;
+static bool jam2Ok = false;
+
+static int jamChannel = 1;
+static bool isAttacking = false;
+static bool exitRequested = false;
+
+static const uint8_t noisePayload[32] = {
+    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
+    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
+    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
+    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA
+};
+
+static uint8_t wifiChannelToNrf(int channel) {
+    return (uint8_t)((channel * 5) + 2);
+}
+
+static void configureRadio(RF24& radio) {
+    radio.powerUp();
+    radio.setAutoAck(false);
+    radio.setRetries(0, 0);
+    radio.setPayloadSize(32);
+    radio.setAddressWidth(5);
+    radio.setPALevel(RF24_PA_MAX, true);
+    radio.setDataRate(RF24_2MBPS);
+    radio.setCRCLength(RF24_CRC_DISABLED);
+    radio.stopListening();
+}
+
+static int activeRadioCount() {
+    return (jam1Ok ? 1 : 0) + (jam2Ok ? 1 : 0);
+}
+
+static void prepareJammerDisplay() {
+    sharedSpiPrepareDisplay(!isAttacking);
+}
+
+static void clearJammerScreen() {
+    prepareJammerDisplay();
+    tft.fillScreen(TFT_BLACK);
+    delay(12);
+    tft.fillRect(0, 0, 320, 240, TFT_BLACK);
+}
+
+static void stopAttack() {
+    isAttacking = false;
+    if (jam1Ok) jam1.stopConstCarrier();
+    if (jam2Ok) jam2.stopConstCarrier();
+}
+
+static void drawHeader(const char* title, const String& status, uint16_t color) {
+    tft.fillRect(0, 0, 320, 36, color);
+    tft.drawRect(0, 0, 320, 240, TFT_WHITE);
+    drawStringBig(10, 10, title, color == TFT_WHITE ? TFT_BLACK : TFT_WHITE, 1);
+    drawStringRight(305, 14, status, color == TFT_WHITE ? TFT_BLACK : TFT_WHITE, 1);
+    tft.drawFastHLine(0, 36, 320, TFT_WHITE);
+}
+
+static void drawChannelGauge(bool full = true) {
+    if (full) {
+        clearJammerScreen();
+        drawHeader("CHANNEL JAMMER", isAttacking ? "ACTIVE" : "READY",
+                   isAttacking ? TFT_RED : TFT_WHITE);
+        tft.drawFastHLine(0, 214, 320, TFT_WHITE);
+        drawStringCustom(8, 222, "UP/DN: CHANNEL", TFT_WHITE, 1);
+        drawStringRight(312, 222, "BACK/OK(H): BACK", TFT_WHITE, 1);
+    } else {
+        prepareJammerDisplay();
+    }
+
+    tft.fillRect(1, 42, 318, 166, TFT_BLACK);
+
+    String chText = "CH " + String(jamChannel);
+    drawStringCentered(56, chText, TFT_YELLOW, 3, FONT_BIG);
+    drawStringCentered(100,
+        String(2400 + wifiChannelToNrf(jamChannel)) + " MHz NRF",
+        TFT_CYAN, 1, FONT_SMALL);
+
+    int pct = 7 + ((jamChannel - 1) * 93) / 13;
+    tft.drawRect(20, 124, 280, 14, TFT_WHITE);
+    tft.fillRect(22, 126, ((276 * pct) / 100), 10,
+                 isAttacking ? TFT_RED : TFT_GREEN);
+
+    drawStringCustom(22, 154, "RADIOS: " + String(activeRadioCount()) + "/" + String(NRF_RADIO_COUNT),
+                     activeRadioCount() > 0 ? TFT_GREEN : TFT_RED, 1);
+
+    if (isAttacking) {
+        uint8_t frame = (millis() / 70) & 0xFF;
+        for (int i = 0; i < 24; i++) {
+            int h = 4 + ((frame + i * 5) % 34);
+            uint16_t c = h > 24 ? TFT_RED : TFT_YELLOW;
+            tft.fillRect(22 + i * 12, 202 - h, 7, h, c);
+        }
+    } else {
+        tft.drawRect(90, 166, 140, 26, TFT_WHITE);
+        drawStringCentered(174, "OK: START", TFT_GREEN, 1, FONT_SMALL);
+    }
+
+}
+
+static void drawChannelBars() {
+    prepareJammerDisplay();
+    tft.fillRect(18, 164, 292, 40, TFT_BLACK);
+    uint8_t frame = (millis() / 70) & 0xFF;
+    for (int i = 0; i < 24; i++) {
+        int h = 4 + ((frame + i * 5) % 34);
+        uint16_t c = h > 24 ? TFT_RED : TFT_YELLOW;
+        tft.fillRect(22 + i * 12, 202 - h, 7, h, c);
+    }
+}
+
+void jammerSetup() {
+    sharedSpiInitPins(true);
+    sharedSpiBeginMainBus();
+    delay(100);
+
+    jam1.begin();
+#if NRF2_ENABLED
+    jam2.begin();
+#else
+    jam2Ok = false;
+#endif
+
+    delay(500);
+
+    bool jam1BeginOk = jam1.begin();
+    jam1Ok = jam1BeginOk && jam1.isChipConnected();
+    if (jam1Ok) configureRadio(jam1);
+
+#if NRF2_ENABLED
+    bool jam2BeginOk = jam2.begin();
+    jam2Ok = jam2BeginOk && jam2.isChipConnected();
+    if (jam2Ok) configureRadio(jam2);
+#endif
+
+    Serial.printf("[jammer] NRF1 CE:%d CSN:%d -> %s\n",
+                  NRF1_CE_PIN, NRF1_CSN_PIN, jam1Ok ? "OK" : "FAIL");
+#if NRF2_ENABLED
+    Serial.printf("[jammer] NRF2 CE:%d CSN:%d -> %s\n",
+                  NRF2_CE_PIN, NRF2_CSN_PIN, jam2Ok ? "OK" : "FAIL");
+#else
+    Serial.println("[jammer] NRF2 disabled");
+#endif
+
+    prepareJammerDisplay();
+}
+
+void jammerLoop() {
+    if (isBackPressed()) {
+        stopAttack();
+        exitRequested = true;
+        while (isBackPressed()) delay(5);
+        flushNavInput(60);
+        return;
+    }
+
+    if (digitalRead(BTN_UP) == LOW) {
+        jamChannel = (jamChannel == 14) ? 1 : jamChannel + 1;
+        if (isAttacking && jam1Ok) {
+            jam1.startConstCarrier(RF24_PA_MAX, wifiChannelToNrf(jamChannel));
+        }
+        if (isAttacking && jam2Ok) {
+            jam2.startConstCarrier(RF24_PA_MAX, wifiChannelToNrf(jamChannel));
+        }
+        drawChannelGauge(false);
+        delay(70);
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW) {
+        jamChannel = (jamChannel == 1) ? 14 : jamChannel - 1;
+        if (isAttacking && jam1Ok) {
+            jam1.startConstCarrier(RF24_PA_MAX, wifiChannelToNrf(jamChannel));
+        }
+        if (isAttacking && jam2Ok) {
+            jam2.startConstCarrier(RF24_PA_MAX, wifiChannelToNrf(jamChannel));
+        }
+        drawChannelGauge(false);
+        delay(70);
+    }
+
+    if (isEnterPressed()) {
+        bool held = waitOkReleaseWasLong();
+        if (held) {
+            stopAttack();
+            exitRequested = true;
+            flushNavInput(60);
+            return;
+        }
+
+        isAttacking = !isAttacking;
+        uint8_t freq = wifiChannelToNrf(jamChannel);
+        if (isAttacking) {
+            if (jam1Ok) jam1.startConstCarrier(RF24_PA_MAX, freq);
+            if (jam2Ok) jam2.startConstCarrier(RF24_PA_MAX, freq);
+        } else {
+            stopAttack();
+        }
+        drawChannelGauge();
+        delay(220);
+    }
+
+    if (isAttacking) {
+        delayMicroseconds(150);
+    }
+}
+
+void runJammer() {
+    while (isEnterPressed() || isBackPressed()) delay(5);
+    delay(100);
+
+    jammerSetup();
+    exitRequested = false;
+    drawChannelGauge();
+
+    if (activeRadioCount() == 0) {
+        drawStringCentered(112, "NRF24 ERROR", TFT_RED, 2, FONT_BIG);
+        drawStringCentered(150, "Check CE/CSN/SPI", TFT_WHITE, 1, FONT_SMALL);
+        delay(2500);
+        clearJammerScreen();
+        flushNavInput(80);
+        return;
+    }
+
+    while (!exitRequested) {
+        jammerLoop();
+        delay(5);
+    }
+
+    stopAttack();
+    if (jam1Ok) jam1.powerDown();
+    if (jam2Ok) jam2.powerDown();
+    clearJammerScreen();
+    while (isEnterPressed() || isBackPressed()) delay(5);
+    flushNavInput(80);
+}

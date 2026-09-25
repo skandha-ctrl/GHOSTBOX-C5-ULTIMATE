@@ -1,0 +1,23 @@
+# Compiled build directories
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary or backup files
+*.bak
+*.tmp
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS specific files
+.DS_Store
+Thumbs.db
